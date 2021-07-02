@@ -245,6 +245,7 @@ const fs = __nccwpck_require__(5747)
 const util = __nccwpck_require__(1669)
 const stream = __nccwpck_require__(2413)
 const crypto = __nccwpck_require__(6417)
+const child_process = __nccwpck_require__(3129)
 const core = __nccwpck_require__(2186)
 const { performance } = __nccwpck_require__(630)
 
@@ -390,6 +391,13 @@ function win2nix(path) {
   return path.replace(/\\/g, '/').replace(/ /g, '\\ ')
 }
 
+// JRuby is installed after setupPath is called, so folder doesn't exist
+function rubyIsUCRT(path) {
+  return !!(fs.existsSync(path) &&
+    fs.readdirSync(path, { withFileTypes: true }).find(dirent =>
+      dirent.isFile() && dirent.name.match(/^x64-ucrt-ruby\d{3}\.dll$/)))
+}
+
 function setupPath(newPathEntries) {
   const envPath = windows ? 'Path' : 'PATH'
   const originalPath = process.env[envPath].split(path.delimiter)
@@ -409,13 +417,27 @@ function setupPath(newPathEntries) {
   }
 
   // Then add new path entries using core.addPath()
-  let newPath
+  let newPath = newPathEntries
   if (windows) {
-    // add MSYS2 in path for all Rubies on Windows, as it provides a better bash shell and a native toolchain
-    const msys2 = ['C:\\msys64\\mingw64\\bin', 'C:\\msys64\\usr\\bin']
-    newPath = [...newPathEntries, ...msys2]
-  } else {
-    newPath = newPathEntries
+    try {
+      // Use RubyInstaller mechanisms to set various evenironment variables including the PATH to MSYS2 tools
+      // Same as "ridk enable" on the command line
+      const envbuf = child_process.execFileSync(`${newPathEntries[0]}\\ruby`, ['-rruby_installer/runtime', '-e', 'puts RubyInstaller::Runtime.msys2_installation.enable_msys_apps_per_cmd'])
+      const envvars = envbuf.toString().trim().split(/\r?\n/)
+
+      envvars.forEach( (envvar) => {
+        console.log(`SET ${envvar}`)
+        const parts = envvar.split("=", 2)
+        core.exportVariable(parts[0], parts[1])
+      })
+    } catch (ex) {
+      // main Ruby dll determines whether mingw or ucrt build
+      let build_sys = rubyIsUCRT(newPathEntries[0]) ? 'ucrt64' : 'mingw64'
+
+      // add MSYS2 in path for all Rubies on Windows, as it provides a better bash shell and a native toolchain
+      const msys2 = [`C:\\msys64\\${build_sys}\\bin`, 'C:\\msys64\\usr\\bin']
+      newPath = [...newPathEntries, ...msys2]
+    }
   }
   console.log(`Entries added to ${envPath} to use selected Ruby:`)
   for (const entry of newPath) {
@@ -58933,7 +58955,7 @@ const versions = {
   "2.7.3": "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-2.7.3-1/rubyinstaller-2.7.3-1-x64.7z",
   "3.0.0": "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-3.0.0-1/rubyinstaller-3.0.0-1-x64.7z",
   "3.0.1": "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-3.0.1-1/rubyinstaller-3.0.1-1-x64.7z",
-  "head": "https://github.com/oneclick/rubyinstaller2/releases/download/rubyinstaller-head/rubyinstaller-head-x64.7z",
+  "head": "https://github.com/oneclick/rubyinstaller2/releases/download/rubyinstaller-head/rubyinstaller-devkit-head-x64.exe",
   "mingw": "https://github.com/MSP-Greg/ruby-loco/releases/download/ruby-master/ruby-mingw.7z",
   "mswin": "https://github.com/MSP-Greg/ruby-loco/releases/download/ruby-master/ruby-mswin.7z"
 }
@@ -58984,10 +59006,10 @@ function getAvailableVersions(platform, engine) {
 async function install(platform, engine, version) {
   const url = rubyInstallerVersions[version]
 
-  if (!url.endsWith('.7z')) {
-    throw new Error(`URL should end in .7z: ${url}`)
+  if (!url.endsWith('.7z') && !url.endsWith('.exe')) {
+    throw new Error(`URL should end in .7z or .exe: ${url}`)
   }
-  const base = url.slice(url.lastIndexOf('/') + 1, url.length - '.7z'.length)
+  const base = url.slice(url.lastIndexOf('/') + 1, url.length).replace(/\.(exe|7z)$/, "")
 
   let rubyPrefix, inToolCache
   if (common.shouldUseToolCache(engine, version)) {
@@ -59003,11 +59025,11 @@ async function install(platform, engine, version) {
 
   let toolchainPaths = (version === 'mswin') ? await setupMSWin() : await setupMingw(version)
 
-  common.setupPath([`${rubyPrefix}\\bin`, ...toolchainPaths])
-
   if (!inToolCache) {
     await downloadAndExtract(engine, version, url, base, rubyPrefix);
   }
+
+  common.setupPath([`${rubyPrefix}\\bin`, ...toolchainPaths])
 
   return rubyPrefix
 }
@@ -59017,11 +59039,17 @@ async function downloadAndExtract(engine, version, url, base, rubyPrefix) {
 
   const downloadPath = await common.measure('Downloading Ruby', async () => {
     console.log(url)
-    return await tc.downloadTool(url)
+    const fname = url.slice(url.lastIndexOf('/') + 1, url.length)
+    return await tc.downloadTool(url, fname)
   })
 
-  await common.measure('Extracting Ruby', async () =>
-    exec.exec('7z', ['x', downloadPath, `-xr!${base}\\share\\doc`, `-o${parentDir}`], { silent: true }))
+  await common.measure('Extracting Ruby', async () => {
+    if (url.endsWith('.7z')) {
+      await exec.exec('7z', ['x', downloadPath, `-xr!${base}\\share\\doc`, `-o${parentDir}`], { silent: true })
+    } else if (url.endsWith('.exe')) {
+      await exec.exec('cmd', ['/c', `${downloadPath} /verysilent /dir=${parentDir}\\${base} /tasks=noassocfiles,nomodpath,noridkinstall /components=ruby,msys2`])
+    }
+  })
 
   if (base !== path.basename(rubyPrefix)) {
     await io.mv(path.join(parentDir, base), rubyPrefix)
